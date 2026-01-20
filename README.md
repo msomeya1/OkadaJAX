@@ -1,2 +1,4 @@
 # OkadaJAX
-JAX version of OkadaTorch
+
+**This repository is under development. Codes will not work properly.**
+
