@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 
-EPS = 1.0e-6
+from .utils import EPS_DIP, _surrogate_grad
 
 def setup(strike, dip, rake, slip, is_degree):
     """
@@ -23,10 +23,11 @@ def setup(strike, dip, rake, slip, is_degree):
         u_dip     = slip * jnp.sin(rake)
 
 
-    # if dip≈±90° then set sd=sign(sd) and cd=0.
-    mask = jnp.abs(cd) < EPS
-    cd = jnp.where(mask, 0.0, cd)
-    sd = jnp.where(mask, jnp.sign(sd), sd)
+    # Snap a near-vertical dip, as `medium_constants` does, on the value only so that
+    # d/d(dip) survives.
+    vertical = jnp.abs(cd) < EPS_DIP
+    sd = _surrogate_grad(vertical, jnp.where(vertical, jnp.sign(sd), sd), sd)
+    cd = _surrogate_grad(vertical, jnp.where(vertical, 0.0, cd), cd)
 
 
     return [ss, cs, sd, cd, u_strike, u_dip]

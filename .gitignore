@@ -1,2 +1,13 @@
 *.pyc
 *.png
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# The original NIED FORTRAN subroutines must never be committed: the permission
+# obtained from NIED covers the ports, not redistribution of the originals.  The
+# tests read frozen golden data and do not need them.
+tests/fortran/
+
+# notebook 6 writes these with np.savetxt; they are outputs, not inputs
+*_obs.txt

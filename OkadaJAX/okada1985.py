@@ -1,13 +1,13 @@
 import jax.numpy as jnp
-from .utils import _SRECTG
+from .utils import (PI2, _SRECTG, _blank_where, _dummy_where, _length_scale,
+                    _on_fault_edge)
 
-PI2 = 2.0 * jnp.pi
 
-
-def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
+def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True,
+           return_iret=False):
     """
     Surface displacement, strain, tilt due to buried point source 
-    in a semiinfinite medium.
+    in a semi-infinite medium.
 
     Parameters
     ----------
@@ -25,6 +25,8 @@ def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
     compute_strain : bool, default True
         Option to calculate the spatial derivative of the displacement. 
         New in the JAX implementation.
+    return_iret : bool, default False
+        Return the singularity flag. New in the JAX implementation.
 
     Returns
     -------
@@ -34,6 +36,7 @@ def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
         [U1, U2, U3, U11, U12, U21, U22, U31, U32]
         If `False`, U is a list of 3 displacements only:
         [U1, U2, U3]
+        Stations flagged by `IRET` are returned as exactly zero.
 
         U1, U2, U3 : JAX array
             Displacement. unit = (unit of dislocation) / area
@@ -47,6 +50,13 @@ def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
     Original FORTRAN code was written by Y.Okada in Jan. 1985.
     JAX implementation by M.Someya in 2026.
     """
+
+    # The only singularity of the point-source solution.  The original FORTRAN
+    # has no test for it and returns NaN; DC3D0 does flag it, so the same rule
+    # is applied here.
+    singular = (X**2 + Y**2 + D**2) == 0.0
+    IRET = jnp.where(singular, 1, jnp.zeros_like(X, dtype=jnp.int32))
+    X, Y = _dummy_where(singular, X, Y)
 
     # Initialization
     if compute_strain:
@@ -152,14 +162,18 @@ def SPOINT(ALP, X, Y, D, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
 
 
     if compute_strain:
-        return [U1, U2, U3, U11, U12, U21, U22, U31, U32]
+        U = [U1, U2, U3, U11, U12, U21, U22, U31, U32]
     else:
-        return [U1, U2, U3]
+        U = [U1, U2, U3]
+    U = _blank_where(singular, U)
+
+    return (U, IRET) if return_iret else U
 
 
 
 
-def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=True):
+def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=True,
+           return_iret=False):
     """
     Surface displacements, strains and tilts due to rectangular fault in a half-space.
 
@@ -181,6 +195,8 @@ def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=T
     compute_strain : bool, default True
         Option to calculate the spatial derivative of the displacement. 
         New in the JAX implementation.
+    return_iret : bool, default False
+        Return the singularity flag. New in the JAX implementation.
 
     Returns
     -------
@@ -190,6 +206,7 @@ def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=T
         [U1, U2, U3, U11, U12, U21, U22, U31, U32]
         If `False`, U is a list of 3 displacements only:
         [U1, U2, U3]
+        Stations flagged by `IRET` are returned as exactly zero.
 
         U1, U2, U3 : JAX array
             Displacement. unit = (unit of dislocation) 
@@ -209,11 +226,16 @@ def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=T
     # Initialization
     N_variable = 9 if compute_strain else 3
     U = [jnp.zeros_like(X) for _ in range(N_variable)]
-    DU = [jnp.zeros_like(X) for _ in range(N_variable)]
 
 
     P = Y * CD + DEP * SD
     Q = Y * SD - DEP * CD
+
+    # Same singular-case test that DC3D uses, so the surface and the depth
+    # formulation agree on which stations are unusable.
+    singular = _on_fault_edge(X, X - AL, P, P - AW, Q,
+                              _length_scale(AL, AW, reference=X))
+    IRET = jnp.where(singular, 1, jnp.zeros_like(X, dtype=jnp.int32))
 
 
     for K in [1, 2]:
@@ -222,14 +244,18 @@ def SRECTF(ALP, X, Y, DEP, AL, AW, SD, CD, DISL1, DISL2, DISL3, compute_strain=T
             XI = (X if (J == 1) else X - AL)
             SIGN = (1.0 if (J + K != 3) else -1.0)
 
+            # Dummy geometry for the singular stations; see `_dummy_where`.
+            XI_s, ET_s, Q_s = _dummy_where(singular, XI, ET, Q)
+
             DU = _SRECTG(
-                ALP, XI, ET, Q, SD, CD, DISL1, DISL2, DISL3, compute_strain
+                ALP, XI_s, ET_s, Q_s, SD, CD, DISL1, DISL2, DISL3, compute_strain
             )
 
             for I in range(N_variable):
                 U[I] = U[I] + SIGN * DU[I]
 
+    U = _blank_where(singular, U)
 
-    return U
+    return (U, IRET) if return_iret else U
     
 

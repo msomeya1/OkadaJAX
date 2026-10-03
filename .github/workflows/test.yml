@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:        # lets you start a run by hand from the Actions tab
+
+concurrency:                # a new push cancels the run still going for the old one
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false      # report every version, not just the first to break
+      matrix:
+        # The floor declared in pyproject.toml and a current release.  Testing
+        # the floor is the only thing that keeps `requires-python` honest.
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install OkadaJAX
+        # A clean install driven only by pyproject.toml; `pip install jax`
+        # brings the CPU build, which is all a runner without a GPU can use.
+        run: pip install -e ".[test]"
+
+      - name: Show versions
+        run: python -c "import sys, jax; print(sys.version); print(jax.__version__, jax.devices())"
+
+      - name: Run tests
+        # The GPU half of the suite skips itself on a CPU-only runner; every
+        # check against the original FORTRAN still runs (it reads golden data,
+        # so no compiler and no FORTRAN sources are needed).
+        run: pytest -q
