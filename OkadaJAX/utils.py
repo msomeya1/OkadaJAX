@@ -41,6 +41,22 @@ def _safe_log(value, keep, fill=0.0):
     return jnp.where(keep, jnp.log(safe), fill)
 
 
+def _atan_ratio(numerator, denominator):
+    """`arctan(numerator / denominator)`, zero where `denominator` is zero.
+
+    Okada sets these arctangents to zero where the denominator vanishes (the
+    mean of the two one-sided limits, +-pi/2).  The derivative, however, is
+    finite there: d/d(den) arctan(num/den) = -num / (num**2 + den**2).  Where
+    |num| > |den| use arctan(u) = sign(u) pi/2 - arctan(1/u), which takes the
+    same value but differentiates without dividing by the denominator.
+    """
+    big = jnp.abs(numerator) > jnp.abs(denominator)
+    direct = jnp.arctan(_safe_div(numerator, denominator, ~big & (denominator != 0.0)))
+    inverse = (jnp.sign(numerator) * jnp.sign(denominator) * (jnp.pi / 2)
+               - jnp.arctan(_safe_div(denominator, numerator, big)))
+    return jnp.where(big, inverse, direct)
+
+
 def _rel_eps(reference):
     """Relative tolerance for length comparisons, tied to the working precision."""
     return REL_EPS_FACTOR * jnp.finfo(jnp.asarray(reference).dtype).eps
@@ -99,7 +115,10 @@ def _snap(value, scale):
     on it whatever unit the caller uses.
     """
     value = jnp.asarray(value)
-    return jnp.where(jnp.abs(value) < _rel_eps(value) * scale, 0.0, value)
+    # value + (-value) is exactly zero, and the gradient passes through: the
+    # formulas downstream are differentiated at zero instead of seeing a constant.
+    small = jnp.abs(value) < _rel_eps(value) * scale
+    return value + lax.stop_gradient(jnp.where(small, -value, 0.0))
 
 
 def _on_fault_edge(XI0, XI1, ET0, ET1, Q, scale):
@@ -133,15 +152,11 @@ def _blank_where(flag, arrays):
     return [jnp.where(flag, 0.0, a) for a in arrays]
 
 
-def _srectg_A_inclined(ALP, XI, ET, Q, SD, CD, R, X, RD, Y, DLE, xi_nonzero):
+def _srectg_A_inclined(ALP, XI, ET, Q, SD, CD, R, X, RD, Y, DLE):
     """A1, A3, A4, A5 of `_SRECTG`, inclined-fault form.  `CD` must be non-zero."""
     TD = SD / CD
-    A5 = jnp.where(
-        xi_nonzero,
-        ALP * 2.0 / CD * jnp.arctan(_safe_div(
-            ET * (X + Q * CD) + X * (R + X) * SD, XI * (R + X) * CD, xi_nonzero
-        )),
-        0.0
+    A5 = ALP * 2.0 / CD * _atan_ratio(
+        ET * (X + Q * CD) + X * (R + X) * SD, XI * (R + X) * CD
     )
     A4 =  ALP / CD * (jnp.log(RD) - SD * DLE)
     A3 =  ALP * ( Y / RD / CD - DLE) + TD * A4
@@ -159,16 +174,12 @@ def _srectg_BC_inclined(ALP, XI, XI2, Q, SD, CD, RD, Y, RRD, RRE):
     return B1, B2, C1, C3
 
 
-def _ub_AI_inclined(XI, ET, Q, SD, CD, SDCD, R, X, RD, Y, ALE, xi_nonzero):
+def _ub_AI_inclined(XI, ET, Q, SD, CD, SDCD, R, X, RD, Y, ALE):
     """AI3, AI4 of `_UB`, inclined-fault form.  `CD` must be non-zero."""
     CDCD = CD**2
-    AI4 = jnp.where(
-        xi_nonzero,
-        1.0 / CDCD * (XI / RD * SDCD + 2.0 * jnp.arctan(_safe_div(
-            ET * (X + Q * CD) + X * (R + X) * SD, XI * (R + X) * CD, xi_nonzero
-        ))),
-        0.0
-    )
+    AI4 = 1.0 / CDCD * (XI / RD * SDCD + 2.0 * _atan_ratio(
+        ET * (X + Q * CD) + X * (R + X) * SD, XI * (R + X) * CD
+    ))
     AI3 = (Y * CD / RD - ALE + SD * jnp.log(RD)) / CDCD
     return AI3, AI4
 
@@ -247,9 +258,8 @@ def _SRECTG(ALP, XI, ET, Q, SD, CD, DISL1, DISL2, DISL3, compute_strain):
     RD = R + D
     
     # Denominators are sanitised before the division; see `_safe_div`.
-    q_nonzero = Q != 0.0
     ret_nonzero = RET != 0.0
-    TT = jnp.arctan(_safe_div(XI * ET, Q * R, q_nonzero))   # arctan(0) == 0
+    TT = _atan_ratio(XI * ET, Q * R)        # zero at Q == 0, as in the FORTRAN
     RE = _safe_div(1.0, RET, ret_nonzero)
     DLE = jnp.where(
         ret_nonzero,
@@ -276,11 +286,10 @@ def _SRECTG(ALP, XI, ET, Q, SD, CD, DISL1, DISL2, DISL3, compute_strain):
     # discarded branch stays finite and the selected values are unchanged.
     vertical = CD == 0.0
     CD_safe = jnp.where(vertical, 1.0, CD)
-    xi_nonzero = XI != 0.0
     X = jnp.sqrt(XI2 + Q2)
 
     A1_inclined, A3_inclined, A4_inclined, A5_inclined = _srectg_A_inclined(
-        ALP, XI, ET, Q, SD, CD_safe, R, X, RD, Y, DLE, xi_nonzero)
+        ALP, XI, ET, Q, SD, CD_safe, R, X, RD, Y, DLE)
 
     RD2 = RD**2
     A1_value = jnp.where(vertical, -ALP / 2.0 * XI * Q / RD2, A1_inclined)
@@ -299,7 +308,7 @@ def _SRECTG(ALP, XI, ET, Q, SD, CD, DISL1, DISL2, DISL3, compute_strain):
     Y_off  = ET * CD_off + Q * SD_off
     RD_off = R + D_off
     A1_surr, A3_surr, A4_surr, A5_surr = _srectg_A_inclined(
-        ALP, XI, ET, Q, SD_off, CD_off, R, X, RD_off, Y_off, DLE, xi_nonzero)
+        ALP, XI, ET, Q, SD_off, CD_off, R, X, RD_off, Y_off, DLE)
 
     A1 = _surrogate_grad(ill_conditioned, A1_value, A1_surr)
     A3 = _surrogate_grad(ill_conditioned, A3_value, A3_surr)
@@ -974,9 +983,8 @@ def _UB(XI, ET, Q, DISL1, DISL2, DISL3, C0, C2, compute_strain):
     vertical = CD == 0.0
     CD_safe = jnp.where(vertical, 1.0, CD)
     X = jnp.sqrt(XI2 + Q2)
-    xi_nonzero = XI != 0.0
     AI3_inclined, AI4_inclined = _ub_AI_inclined(
-        XI, ET, Q, SD, CD_safe, SDCD, R, X, RD, Y, ALE, xi_nonzero)
+        XI, ET, Q, SD, CD_safe, SDCD, R, X, RD, Y, ALE)
     AI3_value = jnp.where(vertical, (ET / RD + Y * Q / RD**2 - ALE) / 2.0, AI3_inclined)
     AI4_value = jnp.where(vertical, XI * Y / RD**2 / 2.0, AI4_inclined)
 
@@ -987,7 +995,7 @@ def _UB(XI, ET, Q, DISL1, DISL2, DISL3, C0, C2, compute_strain):
     Y_off  = ET * CD_off + Q * SD_off
     RD_off = R + D_off
     AI3_surr, AI4_surr = _ub_AI_inclined(
-        XI, ET, Q, SD_off, CD_off, SD_off * CD_off, R, X, RD_off, Y_off, ALE, xi_nonzero)
+        XI, ET, Q, SD_off, CD_off, SD_off * CD_off, R, X, RD_off, Y_off, ALE)
 
     AI3 = _surrogate_grad(ill_conditioned, AI3_value, AI3_surr)
     AI4 = _surrogate_grad(ill_conditioned, AI4_value, AI4_surr)
@@ -1391,9 +1399,9 @@ def fault_geometry(XI, ET, Q, SD, CD, KXI, KET):
     Y = ET * CD + Q * SD
     D = ET * SD - Q * CD
 
-    # Denominators are sanitised before the division; see `_safe_div`.
-    TT = jnp.arctan(_safe_div(XI * ET, Q * R, Q != 0.0))
+    TT = _atan_ratio(XI * ET, Q * R)        # zero at Q == 0, as in the FORTRAN
 
+    # Denominators are sanitised before the division; see `_safe_div`.
     RXI = R + XI
     kxi_regular = KXI != 1
     ALX = jnp.where(kxi_regular,

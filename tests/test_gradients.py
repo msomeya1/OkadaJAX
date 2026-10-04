@@ -153,6 +153,55 @@ def test_a_vertical_fault_can_be_optimised(okada):
     assert abs(float(dip) - 72.0) < 0.1, f"starting from dip=90 the optimiser reached {float(dip)}"
 
 
+
+# ---------------------------------------------------------------------------
+# Stations on the extension of a fault edge or of the fault plane
+# ---------------------------------------------------------------------------
+# One of XI, ET, Q is (snapped to) exactly zero there.  Okada sets the
+# arctangents arctan(XI*ET/(Q*R)) and arctan(.../(XI*...)) to zero where their
+# denominator vanishes; the derivative there is finite but used to come out as
+# zero, and the snapping itself used to discard the gradient of XI, ET and Q.
+# A grid station hits these lines whenever the fault corners lie on the grid.
+# The fault: strike north, dipping east, top edge from (0, 0) to (0, 10) at depth 2.
+EDGE_FAULT = dict(x_fault=0.0, y_fault=0.0, depth=2.0, length=10.0, width=5.0,
+                  strike=0.0, dip=50.0, rake=30.0, slip=1.0)
+TAN_DIP = float(np.tan(np.radians(50.0)))
+EDGE_CASES = [
+    # id,                                 dip,  x,             y,    z
+    ("xi=0-start-surface",                50.0, -3.7,          0.0,  None),
+    ("xi=0-end-surface",                  50.0, -3.7,          10.0, None),
+    ("q=0-vertical-surface",              90.0, 0.0,           15.0, None),
+    ("xi=0-start-depth",                  50.0, -3.7,          0.0,  -3.0),
+    ("xi=0-end-depth",                    50.0, -3.7,          10.0, -3.0),
+    ("eta=0-top-edge-depth",              50.0, -TAN_DIP,      4.3,  -3.0),
+    ("q=0-below-bottom-edge-depth",       50.0, 6.0 / TAN_DIP, 4.3,  -8.0),
+    ("eta=0-vertical-depth",              90.0, -3.7,          4.3,  -2.0),
+    ("q=0-vertical-depth",                90.0, 0.0,           15.0, -3.0),
+]
+
+
+@pytest.mark.parametrize("dip,x,y,z", [pytest.param(*c[1:], id=c[0]) for c in EDGE_CASES])
+def test_gradient_on_the_extension_of_a_fault_edge(okada, dip, x, y, z):
+    cpu = jax.devices("cpu")[0]
+    coords = {"x": put([x], cpu), "y": put([y], cpu)}
+    if z is not None:
+        coords["z"] = put([z], cpu)
+    params = {k: put(v, cpu) for k, v in dict(EDGE_FAULT, dip=dip).items()}
+    vertical = dip == 90.0
+    for name in PARAM_NAMES:
+        if vertical and name == "dip":
+            continue        # a finite difference would cross the snap band at dip=90
+        ad = _ad_grad(okada, coords, params, name)
+        fd = _fd_grad(okada, coords, params, name)
+        if vertical:
+            # Loose: the known near-vertical limitation, see
+            # test_non_dip_gradients_on_a_vertical_fault.  The bug this guards
+            # against is a gradient of zero, or wrong by tens of percent.
+            assert abs(ad - fd) < 1e-2 * max(abs(fd), abs(ad), 1e-12), \
+                f"d/d({name}): AD={ad!r} vs FD={fd!r}"
+        else:
+            _assert_close(ad, fd, f"d/d({name})")
+
 @pytest.mark.parametrize("name", PARAM_NAMES)
 @pytest.mark.parametrize("with_z", [False, True], ids=["surface", "depth"])
 def test_every_source_parameter_can_be_vmapped(okada, name, with_z):
@@ -166,3 +215,50 @@ def test_every_source_parameter_can_be_vmapped(okada, name, with_z):
     for i in range(3):
         one = okada.compute(coords, dict(params, **{name: vals[i]}), compute_strain=False)[0]
         assert bool(jnp.allclose(out[i], one, rtol=1e-12, atol=1e-15))
+
+
+@pytest.mark.xfail(strict=True, reason="known limitation near a vertical fault "
+                   "(README, Remark 4): gradients good to about 1e-3")
+@pytest.mark.parametrize("with_z", [False, True], ids=["surface", "depth"])
+def test_non_dip_gradients_on_a_vertical_fault(okada, with_z):
+    """Near dip=90 the A-, B- and C-terms take their whole derivative from the
+    inclined formula at a dip rotated DIP_GRAD_FLOOR away, so every parameter is
+    off by about 1e-3 (surface) or 1e-4 (depth), up to 1% next to the plane of
+    the fault.  Extrapolating from two rotations would bring this to about 1e-6
+    but costs 10-30% on every evaluation, so it was not adopted."""
+    cpu = jax.devices("cpu")[0]
+    coords = make_coords(cpu, with_z=with_z)
+    params = make_params(cpu, dip=90.0)
+    for name in PARAM_NAMES:
+        if name != "dip":
+            _assert_close(_ad_grad(okada, coords, params, name),
+                          _fd_grad(okada, coords, params, name), f"d/d({name}) at dip=90")
+
+
+@pytest.mark.parametrize("with_z", [False, True], ids=["surface", "depth"])
+def test_gradients_inside_the_surrogate_zone_continue_those_outside(okada, with_z):
+    """Below |cos(dip)| = DIP_GRAD_FLOOR every derivative comes from the surrogate.
+    The gradient is a smooth function of cos(dip), so a polynomial fitted to the
+    gradients just outside the zone, where the inclined formulae are accurate,
+    predicts those inside it.  A finite difference cannot check this: the values
+    there lose digits to the same 1/cos(dip) cancellation.  For the same reason
+    1e-6 < |cos(dip)| < 1e-4 is left out: the values themselves, and with them
+    d/d(rake) and d/d(slip), are good to only about eps/cos(dip)**2 there.
+
+    The tolerance is the known limitation (README, Remark 4), about 1e-3; this
+    guards against it getting worse."""
+    cpu = jax.devices("cpu")[0]
+    coords = make_coords(cpu, with_z=with_z)
+    grad = jax.jit(jax.grad(lambda p: _functional(okada, coords, p)))
+
+    def gradients(cos_dip):
+        g = grad(make_params(cpu, dip=float(np.degrees(np.arccos(cos_dip)))))
+        return np.array([float(g[k]) for k in PARAM_NAMES])
+
+    nodes = np.array([2e-3, 4e-3, 6e-3, 8e-3, 1e-2])
+    coef = np.polyfit(nodes, np.stack([gradients(c) for c in nodes]), len(nodes) - 1)
+    for cos_dip in (9e-4, 1e-4, 0.0):
+        got, ref = gradients(cos_dip), np.polyval(coef, cos_dip)
+        for name, a, b in zip(PARAM_NAMES, got, ref):
+            err = abs(a - b) / max(abs(a), abs(b), 1e-12)
+            assert err < 2e-3, f"d/d({name}) at cos(dip)={cos_dip}: {a!r} vs {b!r} (rel. err {err:.3e})"

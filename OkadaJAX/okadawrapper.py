@@ -109,9 +109,10 @@ def _validate(coords, params, fault_origin="topleft", nu=0.25):
 
     if used_dtype in (jnp.float32, jnp.float16, jnp.bfloat16):
         warnings.warn(
-            f"OkadaJAX is running in {jnp.dtype(used_dtype).name}. On a typical fault "
-            f"this costs around 0.2% on the displacements and leaves the gradients "
-            f"good to three or four digits. JAX uses float32 unless float64 is enabled with "
+            f"OkadaJAX is running in {jnp.dtype(used_dtype).name}. On a large fault "
+            f"this costs up to around 0.2% on the displacements and leaves the gradients "
+            f"good to three or four digits; a small fault far from the stations can be "
+            f"off by a few percent. JAX uses float32 unless float64 is enabled with "
             f"jax.config.update('jax_enable_x64', True) at the start of the "
             f"program -- without it, float64 numpy arrays are silently truncated.",
             stacklevel=3)
